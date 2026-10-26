@@ -17,6 +17,10 @@ except ModuleNotFoundError:
 import warnings
 
 
+def _has_musa() -> bool:
+    return hasattr(torch, "musa") and torch.musa.is_available()
+
+
 __all__ = [
     'flash_attention',
     'attention',
@@ -34,6 +38,8 @@ def _gpu_supports_flash_attention():
         return cap[0] >= 8
     except Exception:
         return False
+
+
 
 
 def _sdpa_attention_fallback(
@@ -95,7 +101,17 @@ def flash_attention(
     """
     half_dtypes = (torch.float16, torch.bfloat16)
     assert dtype in half_dtypes
-    assert q.device.type == 'cuda' and q.size(-1) <= 256
+    if q.size(-1) > 256 or (q.device.type != 'cuda' and not _has_musa()):
+        return _sdpa_attention_fallback(
+            q, k, v,
+            q_lens=q_lens,
+            k_lens=k_lens,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            q_scale=q_scale,
+            causal=causal,
+            dtype=dtype,
+        )
 
     # Use PyTorch SDPA on pre-Ampere GPUs (FlashAttention requires Ampere or newer)
     if not _gpu_supports_flash_attention():

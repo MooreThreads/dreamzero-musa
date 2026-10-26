@@ -13,11 +13,15 @@ __all__ = ['WanModel']
 
 ENABLE_TENSORRT = os.getenv("ENABLE_TENSORRT", "False").lower() == "true"
 
+
+def _has_musa() -> bool:
+    return hasattr(torch, "musa") and torch.musa.is_available()
+
 def sinusoidal_embedding_1d(dim: int, position: torch.Tensor) -> torch.Tensor:
     # preprocess
     assert dim % 2 == 0
     half = dim // 2
-    position = position.type(torch.float64)
+    position = position.to(torch.float32)
 
     # calculation
     sinusoid = torch.outer(
@@ -27,7 +31,7 @@ def sinusoidal_embedding_1d(dim: int, position: torch.Tensor) -> torch.Tensor:
 
 
 def rope_params(max_seq_len, dim, theta=10000):
-    if ENABLE_TENSORRT:
+    if ENABLE_TENSORRT or _has_musa():
         return rope_params_no_polar(max_seq_len, dim, theta)
     else:
         return rope_params_polar(max_seq_len, dim, theta)
@@ -55,7 +59,7 @@ def rope_params_no_polar(max_seq_len: int, dim: int, theta: float = 10000) -> to
     return emb
 
 def rope_apply(x, grid_sizes, freqs):
-    if ENABLE_TENSORRT:
+    if ENABLE_TENSORRT or not freqs.is_complex():
         return rope_apply_no_polar(x, freqs)
     else:
         return rope_apply_polar(x, freqs)
@@ -90,7 +94,7 @@ def rope_apply_no_polar(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
 
 
 def rope_action_apply(x, freqs, freqs_action, freqs_state, action_register_length, num_action_per_block=32, num_state_per_block=1):
-    if ENABLE_TENSORRT:
+    if ENABLE_TENSORRT or not freqs.is_complex():
         return rope_action_apply_no_polar(x, freqs, freqs_action, freqs_state, action_register_length, num_action_per_block, num_state_per_block)
     else:
         return rope_action_apply_polar(x, freqs, freqs_action, freqs_state, action_register_length, num_action_per_block, num_state_per_block)

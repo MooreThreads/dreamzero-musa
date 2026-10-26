@@ -32,12 +32,19 @@ import imageio
 
 logger = logging.getLogger(__name__)
 
+
+def _has_musa() -> bool:
+    return hasattr(torch, "musa") and torch.musa.is_available()
+
 import cv2
 import numpy as np
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
-import tyro
+try:
+    import tyro
+except ModuleNotFoundError:
+    tyro = None
 
 # Avoid FailOnRecompileLimitHit when serving: the flow scheduler's torch.compile'd
 # multistep_uni_p_bh_update recompiles under varying shapes/inputs (e.g. batch size,
@@ -112,8 +119,12 @@ def _maybe_init_distributed():
         return
     os.environ.setdefault("MASTER_ADDR", "localhost")
     os.environ.setdefault("MASTER_PORT", "29500")
-    dist.init_process_group(backend="nccl", rank=0, world_size=1)
-    torch.cuda.set_device(0)
+    backend = "gloo" if _has_musa() else "nccl"
+    dist.init_process_group(backend=backend, rank=0, world_size=1)
+    if _has_musa():
+        torch.musa.set_device(0)
+    else:
+        torch.cuda.set_device(0)
 
 
 # Modality key mappings: client observation keys -> model input keys per embodiment.
@@ -342,7 +353,7 @@ def main(
     logging.basicConfig(level=logging.INFO, force=True)
 
     _maybe_init_distributed()
-    device_mesh = init_device_mesh("cuda", mesh_shape=(1,), mesh_dim_names=("ip",))
+    device_mesh = None if _has_musa() else init_device_mesh("cuda", mesh_shape=(1,), mesh_dim_names=("ip",))
 
     logger.info("Loading DreamZero Wan22 policy from %s (embodiment=%s)", model_path, embodiment_tag)
     checkpoint_name = os.path.basename(model_path.rstrip("/"))
@@ -351,7 +362,7 @@ def main(
         embodiment_tag=EmbodimentTag(embodiment_tag),
         model_path=model_path,
         tokenizer_path_override=tokenizer_path,
-        device="cuda" if torch.cuda.is_available() else "cpu",
+        device="musa" if _has_musa() else ("cuda" if torch.cuda.is_available() else "cpu"),
         device_mesh=device_mesh,
     )
     if image_height is not None and image_width is not None:
@@ -387,5 +398,25 @@ def main(
     server.serve_forever()
 
 
+def _argparse_cli() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Serve DreamZero Wan22 policy")
+    parser.add_argument("--model_path", default="./checkpoints/dreamzero_droid_wan22_smoke")
+    parser.add_argument("--embodiment_tag", default="oxe_droid")
+    parser.add_argument("--tokenizer_path", default=None)
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--image_height", type=int, default=None)
+    parser.add_argument("--image_width", type=int, default=None)
+    parser.add_argument("--save_video_pred", action="store_true")
+    parser.add_argument("--video_output_dir", default="./video_pred_output")
+    args = parser.parse_args()
+    main(**vars(args))
+
+
 if __name__ == "__main__":
-    tyro.cli(main)
+    if tyro is not None:
+        tyro.cli(main)
+    else:
+        _argparse_cli()

@@ -1,11 +1,13 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 
 import contextlib
+import inspect
 import torch
 from torch.profiler import profile, ProfilerActivity
 import time
 from typing import Optional
 import os
+import warnings
 
 try:
     import flash_attn_interface
@@ -25,6 +27,15 @@ try:
 except ModuleNotFoundError:
     FLASH_ATTN_2_AVAILABLE = False
 
+FLASH_ATTN_2_SUPPORTS_DROPOUT = False
+if FLASH_ATTN_2_AVAILABLE:
+    try:
+        FLASH_ATTN_2_SUPPORTS_DROPOUT = (
+            "dropout_p" in inspect.signature(flash_attn.flash_attn_varlen_func).parameters
+        )
+    except (TypeError, ValueError):
+        FLASH_ATTN_2_SUPPORTS_DROPOUT = True
+
 try:
     import transformer_engine
     from groot.vla.model.dreamzero.modules.cudnn_attention import DotProductAttention
@@ -32,13 +43,21 @@ try:
 except ModuleNotFoundError:
     TRANSFORMER_ENGINE_AVAILABLE = False
 
-import warnings
+def _has_musa() -> bool:
+    return hasattr(torch, "musa") and torch.musa.is_available()
 
 
 def _gpu_supports_flash_attention():
     """FlashAttention requires Ampere (compute capability 8.0) or newer."""
     if not (FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE):
         return False
+    if _has_musa():
+        try:
+            props = torch.musa.get_device_properties(torch.musa.current_device())
+            major = int(str(props.major).split(',', 1)[0])
+            return major >= 3
+        except Exception:
+            return False
     try:
         if not torch.cuda.is_available():
             return False
@@ -46,7 +65,6 @@ def _gpu_supports_flash_attention():
         return cap[0] >= 8
     except Exception:
         return False
-
 
 def _sdpa_attention_fallback(
     q, k, v,
@@ -116,7 +134,7 @@ def flash_attention(
 
     half_dtypes = (torch.float16, torch.bfloat16)
     assert dtype in half_dtypes
-    assert q.device.type == 'cuda' and q.size(-1) <= 256
+    assert (q.device.type == 'cuda' or _has_musa()) and q.size(-1) <= 256
 
     # Use PyTorch SDPA on pre-Ampere GPUs (FlashAttention requires Ampere or newer)
     if not _gpu_supports_flash_attention():
@@ -182,7 +200,7 @@ def flash_attention(
             causal=causal,
             deterministic=deterministic)[0].unflatten(0, (b, lq))
     elif FLASH_ATTN_2_AVAILABLE:
-        x = flash_attn.flash_attn_varlen_func(
+        fa2_kwargs = dict(
             q=q,
             k=k,
             v=v,
@@ -190,11 +208,16 @@ def flash_attention(
             cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=lq,
             max_seqlen_k=lk,
-            dropout_p=dropout_p,
             softmax_scale=softmax_scale,
             causal=causal,
             window_size=window_size,
-            deterministic=deterministic).unflatten(0, (b, lq))
+            deterministic=deterministic,
+        )
+        if FLASH_ATTN_2_SUPPORTS_DROPOUT:
+            fa2_kwargs["dropout_p"] = dropout_p
+        elif dropout_p:
+            raise ValueError("This FlashAttention backend does not support dropout_p")
+        x = flash_attn.flash_attn_varlen_func(**fa2_kwargs).unflatten(0, (b, lq))
     else:
         raise ValueError(f"Invalid version: {version}")
 
@@ -227,6 +250,9 @@ class AttentionModule(torch.nn.Module):
 
         # Check for TensorRT at runtime, not import time
         if os.getenv("ENABLE_TENSORRT", "False").lower() == "true":
+            backend = "torch"
+
+        if _has_musa() and backend in ["FA3", "TE"]:
             backend = "torch"
 
         # Fall back to FA backend if TE is specified but not available
@@ -309,6 +335,29 @@ class AttentionModule(torch.nn.Module):
                 q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                 q_lens: Optional[torch.Tensor], k_lens: Optional[torch.Tensor],
             ) -> torch.Tensor:
+                batch_chunk = int(os.getenv("MUSA_FA2_BATCH_CHUNK", "0"))
+                if _has_musa() and batch_chunk > 0 and q.size(0) > batch_chunk:
+                    outputs = []
+                    for start in range(0, q.size(0), batch_chunk):
+                        end = min(start + batch_chunk, q.size(0))
+                        outputs.append(
+                            flash_attention(
+                                q=q[start:end],
+                                k=k[start:end],
+                                v=v[start:end],
+                                q_lens=None if q_lens is None else q_lens[start:end],
+                                k_lens=None if k_lens is None else k_lens[start:end],
+                                dropout_p=dropout_p,
+                                softmax_scale=softmax_scale,
+                                q_scale=q_scale,
+                                causal=causal,
+                                window_size=window_size,
+                                deterministic=deterministic,
+                                dtype=dtype,
+                                version=3 if backend == "FA3" else 2,
+                            )
+                        )
+                    return torch.cat(outputs, dim=0)
                 return flash_attention(
                     q=q, k=k, v=v,
                     q_lens=q_lens, k_lens=k_lens,

@@ -31,6 +31,8 @@ from hydra.utils import instantiate
 import numpy as np
 from omegaconf import DictConfig, OmegaConf, open_dict
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.profiler import ProfilerActivity, profile
 from torch.utils.data import DataLoader, Dataset, Sampler
 import transformers
@@ -64,6 +66,36 @@ allowlist = [np_core.multiarray._reconstruct, np.ndarray, np.dtype]
 # all versions of numpy
 allowlist += [type(np.dtype(np.uint32))]
 torch.serialization.add_safe_globals(allowlist)
+
+
+def _is_musa_available():
+    return hasattr(torch, "musa") and torch.musa.is_available()
+
+
+def _install_musa_linear_bf16_patch():
+    """Work around the MUSA fused Linear+Bias issue without affecting CUDA."""
+    if getattr(nn.Linear, "_dreamzero_musa_bf16_patch", False):
+        return
+    if not _is_musa_available():
+        return
+    original_forward = nn.Linear.forward
+
+    def _split_linear_forward(self, input):
+        if input.dtype is not torch.bfloat16:
+            return original_forward(self, input)
+        weight = self.weight if self.weight.dtype is torch.bfloat16 else self.weight.to(torch.bfloat16)
+        output = F.linear(input, weight, None)
+        if self.bias is not None:
+            bias = self.bias if self.bias.dtype is torch.bfloat16 else self.bias.to(torch.bfloat16)
+            output = output + bias
+        return output
+
+    nn.Linear.forward = _split_linear_forward
+    nn.Linear._dreamzero_musa_bf16_patch = True
+
+
+if os.getenv("DREAMZERO_MUSA_LINEAR_BF16_PATCH", "true").lower() == "true":
+    _install_musa_linear_bf16_patch()
 
 # Define LayerNorm classes locally to replace deprecated ALL_LAYERNORM_LAYERS
 LAYERNORM_LAYERS = [

@@ -26,6 +26,7 @@ dependencies = [
     "pyttsx3==2.90",
     "scipy==1.15.3",
     "numpy==1.26.4",
+    "h5py",
     "matplotlib",
     "hydra-core",
     "ray[default]==2.47.1",

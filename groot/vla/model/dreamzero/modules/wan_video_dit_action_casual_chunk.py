@@ -11,6 +11,7 @@ from groot.vla.model.dreamzero.modules.wan2_1_submodule import (
     WanLayerNorm,
     WAN_CROSSATTENTION_CLASSES,
     rope_params,
+    rope_params_no_polar,
     MLPProj,
     sinusoidal_embedding_1d
 )
@@ -26,6 +27,20 @@ import torch.distributed as dist
 import os
 
 ENABLE_TENSORRT = os.getenv("ENABLE_TENSORRT", "False").lower() == "true"
+STATE_SELF_ATTN_MANUAL_SPLIT = os.getenv("DREAMZERO_STATE_SELF_ATTN_MANUAL_SPLIT", "True").lower() == "true"
+CLEAN_FIRST_SDPA_MATH = os.getenv("DREAMZERO_CLEAN_FIRST_SDPA_MATH", "False").lower() == "true"
+
+
+def _has_musa() -> bool:
+    return hasattr(torch, "musa") and torch.musa.is_available()
+
+
+def _use_clean_first_sdpa_math() -> bool:
+    return _has_musa() and CLEAN_FIRST_SDPA_MATH and os.getenv("ATTENTION_BACKEND") == "torch"
+
+
+def _use_manual_state_attention() -> bool:
+    return _has_musa() and STATE_SELF_ATTN_MANUAL_SPLIT
 
 
 class CategorySpecificLinear(nn.Module):
@@ -91,10 +106,61 @@ class MultiEmbodimentActionEncoder(nn.Module):
 
 
 def causal_rope_action_apply(x, freqs, freqs_action, freqs_state, action_register_length, num_action_per_block, num_state_per_block, action_state_index):
-    if ENABLE_TENSORRT:
+    if ENABLE_TENSORRT or not freqs.is_complex():
         return causal_rope_action_apply_no_polar(x, freqs, freqs_action, freqs_state, action_register_length, num_action_per_block, num_state_per_block, action_state_index)
     else:
         return causal_rope_action_apply_polar(x, freqs, freqs_action, freqs_state, action_register_length, num_action_per_block, num_state_per_block, action_state_index)
+
+
+class ManualSplitAttentionModule(nn.Module):
+    def __init__(self, causal: bool = False):
+        super().__init__()
+        self.causal = causal
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        out_dtype = q.dtype
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        scale = 1.0 / math.sqrt(q.size(-1))
+        logits = torch.matmul(q, k.transpose(-1, -2)) * scale
+        if self.causal:
+            causal_mask = torch.triu(
+                torch.ones(
+                    logits.shape[-2], logits.shape[-1],
+                    device=logits.device,
+                    dtype=torch.bool,
+                ),
+                diagonal=1,
+            )
+            logits = logits.masked_fill(causal_mask, torch.finfo(logits.dtype).min)
+        attn = torch.softmax(logits, dim=-1)
+        out = torch.matmul(attn, v)
+        return out.transpose(1, 2).contiguous().to(out_dtype)
+
+
+class MATHBackendAttentionModule(nn.Module):
+    def __init__(self, causal: bool = False):
+        super().__init__()
+        self.causal = causal
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+
+        out_dtype = q.dtype
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        with sdpa_kernel(SDPBackend.MATH):
+            out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=None,
+                is_causal=self.causal,
+                dropout_p=0.0,
+            )
+        return out.transpose(1, 2).contiguous().to(out_dtype)
 
 
 def causal_rope_action_apply_no_polar(
@@ -221,6 +287,8 @@ class CausalWanSelfAttention(nn.Module):
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.attn = AttentionModule(num_heads=self.num_heads, head_dim=self.head_dim)
         self.causal_attn = AttentionModule(num_heads=self.num_heads, head_dim=self.head_dim, causal=True)
+        self.state_attn = ManualSplitAttentionModule() if _use_manual_state_attention() else self.attn
+        self.clean_first_attn = MATHBackendAttentionModule() if _use_clean_first_sdpa_math() else self.attn
 
     def _visualize_attention_mask(self, total_len, first_image_len, image_blocks_len, 
                                    action_len, state_len, num_image_blocks, 
@@ -544,7 +612,7 @@ class CausalWanSelfAttention(nn.Module):
             state_block_start = state_block_starts[block_idx]
             state_block_end = state_block_ends[block_idx]
             
-            output[:, state_block_start:state_block_end] = self.attn(
+            output[:, state_block_start:state_block_end] = self.state_attn(
                 q[:, state_block_start:state_block_end],
                 k[:, state_block_start:state_block_end],
                 v[:, state_block_start:state_block_end]
@@ -566,7 +634,7 @@ class CausalWanSelfAttention(nn.Module):
         
         if num_blocks == 0:
             # Only first frame - single attention call
-            return self.attn(
+            return self.clean_first_attn(
                 clean_image_q[:, :self.frame_seqlen],
                 clean_image_k[:, :self.frame_seqlen],
                 clean_image_v[:, :self.frame_seqlen]
@@ -577,49 +645,34 @@ class CausalWanSelfAttention(nn.Module):
         output = torch.empty_like(clean_image_q)
         
         # First frame: conditioning, self-attention only
-        output[:, :self.frame_seqlen] = self.attn(
+        output[:, :self.frame_seqlen] = self.clean_first_attn(
             clean_image_q[:, :self.frame_seqlen],
             clean_image_k[:, :self.frame_seqlen],
             clean_image_v[:, :self.frame_seqlen]
         )
         
-        # OPTIMIZATION: Process all blocks together with causal masking
-        # For global attention (no local_attn_size), we can process all blocks in one call
+        block_starts = [self.frame_seqlen + i * block_size for i in range(num_blocks)]
+        block_ends = [min(start + block_size, total_len) for start in block_starts]
+
         if self.local_attn_size == -1:
-            # Single attention call for all blocks!
-            # Each position can attend to first_frame + everything up to itself
+            # Fast path: one causal FA2/SDPA call for all clean image blocks.
             blocks_q = clean_image_q[:, self.frame_seqlen:]
-            blocks_k = clean_image_k  # Can attend to everything including first frame
+            blocks_k = clean_image_k
             blocks_v = clean_image_v
-            
-            # Use causal masking: each block token can see first frame + all previous tokens
-            output[:, self.frame_seqlen:] = self.causal_attn(
-                blocks_q, blocks_k, blocks_v
-            )
+            output[:, self.frame_seqlen:] = self.causal_attn(blocks_q, blocks_k, blocks_v)
         else:
-            # With local attention, we still need to loop but with optimizations
-            # Pre-compute all block boundaries to reduce overhead
-            block_starts = [self.frame_seqlen + i * block_size for i in range(num_blocks)]
-            block_ends = [min(start + block_size, total_len) for start in block_starts]
-            
-            for block_idx in range(num_blocks):
-                block_start = block_starts[block_idx]
-                block_end = block_ends[block_idx]
-                
+            for block_start, block_end in zip(block_starts, block_ends):
                 q_block = clean_image_q[:, block_start:block_end]
-                
-                # Context: first frame + recent blocks within local_attn_size
                 image_kv_start = max(self.frame_seqlen, block_end - self.local_attn_size * self.frame_seqlen)
                 k_context = torch.cat([
-                    clean_image_k[:, :self.frame_seqlen],  # First frame
-                    clean_image_k[:, image_kv_start:block_end]  # Recent blocks + current
+                    clean_image_k[:, :self.frame_seqlen],
+                    clean_image_k[:, image_kv_start:block_end],
                 ], dim=1)
                 v_context = torch.cat([
                     clean_image_v[:, :self.frame_seqlen],
-                    clean_image_v[:, image_kv_start:block_end]
+                    clean_image_v[:, image_kv_start:block_end],
                 ], dim=1)
-                
-                output[:, block_start:block_end] = self.attn(q_block, k_context, v_context)
+                output[:, block_start:block_end] = self.clean_first_attn(q_block, k_context, v_context)
         
         return output
     
@@ -1412,10 +1465,12 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         
         self.freqs_action = rope_params(1024*10, d)
         self.freqs_state = rope_params(1024, d)
+        use_real_rope = _has_musa() or ENABLE_TENSORRT
+        rope_params_impl = rope_params_no_polar if use_real_rope else rope_params
         self.freqs = [
-            rope_params(1024, d - 4 * (d // 6)),
-            rope_params(1024, 2 * (d // 6)),
-            rope_params(1024, 2 * (d // 6)),
+            rope_params_impl(1024, d - 4 * (d // 6)),
+            rope_params_impl(1024, 2 * (d // 6)),
+            rope_params_impl(1024, 2 * (d // 6)),
         ]
         if model_type in ('i2v', 'ti2v'):
             self.img_emb = MLPProj(1280, dim)
@@ -1423,7 +1478,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # initialize weights
         self.init_weights()
 
-        self.gradient_checkpointing = True
+        self.gradient_checkpointing = os.getenv("DREAMZERO_GRADIENT_CHECKPOINTING", "True").lower() == "true"
         self.independent_first_frame = False if self.num_frame_per_block == 1 else True
 
 
@@ -2140,7 +2195,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     use_reentrant=False,
                 )
             else:
-                x = block(x, **kwargs)
+                x, updated_kv_cache = block(x, **kwargs)
+                assert updated_kv_cache is None
 
         if clean_x is not None:
             x = x[:, clean_x.shape[1]:]
@@ -2210,6 +2266,13 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         f, h, w = grid_size.tolist()
         freqs = torch.cat(
+            [
+                self.freqs[0][start_frame:start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
+            ],
+            dim=-1
+        ).reshape(f * h * w, -1) if _has_musa() or ENABLE_TENSORRT else torch.cat(
             [
                 self.freqs[0][start_frame:start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
                 self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),

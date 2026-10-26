@@ -76,8 +76,9 @@ class WebsocketClientPolicy(BasePolicy):
         return msgpack_numpy.unpackb(response)
 
     @override
-    def reset(self, reset_info: Dict) -> None:
+    def reset(self, reset_info: Dict | None = None) -> None:
         # Notify server that we're calling the reset endpoint (as opposed to the infer endpoint)
+        reset_info = {} if reset_info is None else reset_info
         reset_info["endpoint"] = "reset"
 
         data = self._packer.pack(reset_info)
